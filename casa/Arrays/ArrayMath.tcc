@@ -41,6 +41,14 @@
 #include <cassert>
 #include <cmath>
 #include <functional>
+#include <climits>
+
+#ifdef __AVX__
+  #include <emmintrin.h>
+  #include <immintrin.h>
+  #include <smmintrin.h>
+  #include <xmmintrin.h>
+#endif
 
 namespace casacore { //# NAMESPACE CASACORE - BEGIN
 
@@ -140,6 +148,98 @@ Array<T, Alloc> arrayTransformResult (const Array<T, Alloc>& arr, UnaryOperator 
 }
 
 
+
+#ifdef __AVX__
+template<typename T>
+bool inline min_max_avx(const T *arr, size_t N, T &min, size_t &minPos, T &max,
+              size_t &maxPos) {
+  return false;
+}
+// TODO: Add template specialisation for double, int, int64
+template<>
+bool inline min_max_avx(const float *arr, size_t N, float &min, size_t &minPos, float &max,
+              size_t &maxPos) {
+  const int simd_width = 8;
+  __m256 arr_r = _mm256_loadu_ps(arr);
+  __m256 max_r = arr_r;
+  __m256 min_r = arr_r;
+
+  __m256i idx_r = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+  __m256i min_pos_r = idx_r;
+  __m256i max_pos_r = idx_r;
+
+  __m256i inc = _mm256_set1_epi32(simd_width);
+
+  size_t quot = N / simd_width;
+  size_t limit = quot * simd_width;
+
+  for (size_t i = simd_width; i < limit; i += simd_width) {
+    idx_r = _mm256_add_epi32(idx_r, inc);
+    arr_r = _mm256_loadu_ps(arr + i);
+
+    __m256i min_mask =
+        _mm256_castps_si256(_mm256_cmp_ps(arr_r, min_r, _CMP_LT_OQ));
+    __m256i max_mask =
+        _mm256_castps_si256(_mm256_cmp_ps(arr_r, max_r, _CMP_GT_OQ));
+
+    min_r = _mm256_min_ps(min_r, arr_r);
+    min_pos_r = _mm256_blendv_epi8(min_pos_r, idx_r, min_mask);
+
+    max_r = _mm256_max_ps(max_r, arr_r);
+    max_pos_r = _mm256_blendv_epi8(max_pos_r, idx_r, max_mask);
+  }
+
+  // Unload from vector register and reduce
+  float max_tmp[simd_width];
+  float min_tmp[simd_width];
+
+  uint32_t max_pos_temp[simd_width];
+  uint32_t min_pos_temp[simd_width];
+
+  _mm256_storeu_ps(min_tmp, min_r);
+  _mm256_storeu_si256((__m256i_u *)min_pos_temp, min_pos_r);
+
+  _mm256_storeu_ps(max_tmp, max_r);
+  _mm256_storeu_si256((__m256i_u *)max_pos_temp, max_pos_r);
+
+  max = max_tmp[0];
+  maxPos = max_pos_temp[0];
+  min = min_tmp[0];
+  minPos = min_pos_temp[0];
+
+  for (int i = 1; i < simd_width; i++) {
+    if (max_tmp[i] > max) {
+      max = max_tmp[i];
+      maxPos = max_pos_temp[i];
+    } else if (max_tmp[i] == max) {
+      maxPos = std::min(maxPos, size_t(max_pos_temp[i]));
+    }
+    if (min_tmp[i] < min) {
+      min = min_tmp[i];
+      minPos = min_pos_temp[i];
+    } else if (min_tmp[i] == min) {
+      minPos = std::min(minPos, size_t(min_pos_temp[i]));
+    }
+  }
+
+  // Min max for reminder
+  for (size_t i = limit; i < N; i++) {
+    if (max < arr[i]) {
+      max = arr[i];
+      maxPos = i;
+    }
+    if (min > arr[i]) {
+      min = arr[i];
+      minPos = i;
+    }
+  }
+  return true;
+}
+#endif
+
+
+
 // <thrown>
 //   <item> ArrayError
 // </thrown>
@@ -159,14 +259,25 @@ void minMax(T &minVal, T &maxVal,
   T minv = array.data()[0];
   T maxv = minv;
   if (array.contiguousStorage()) {
-    typename Array<T, Alloc>::const_contiter iter = array.cbegin();
-    for (size_t i=0; i<n; ++i, ++iter) {
-      if (*iter < minv) {
-        minv = *iter;
-        minp = i;
-      } else if (*iter > maxv) {
-        maxv = *iter;
-        maxp = i;
+    bool vectorized = false;
+
+    #ifdef __AVX__
+      if (n < INT_MAX) {
+        const T *arrRaw = array.data();
+        vectorized = min_max_avx(arrRaw, n, minv, minp, maxv, maxp);
+      }
+    #endif
+
+    if (!vectorized) {
+      typename Array<T, Alloc>::const_contiter iter = array.cbegin();
+      for (size_t i=0; i<n; ++i, ++iter) {
+        if (*iter < minv) {
+          minv = *iter;
+          minp = i;
+        } else if (*iter > maxv) {
+          maxv = *iter;
+          maxp = i;
+        }
       }
     }
   } else {
@@ -188,6 +299,102 @@ void minMax(T &minVal, T &maxVal,
   minVal = minv;
   maxVal = maxv;
 }
+
+
+
+#ifdef __AVX__
+template<typename T>
+bool inline min_max_avx(const T *arr, const T *weight, size_t N, T &min, size_t &minPos,
+              T &max, size_t &maxPos) {
+  return false;
+}
+template<>
+bool inline min_max_avx(const float *arr, const float *weight, size_t N, float &min, size_t &minPos,
+              float &max, size_t &maxPos) {
+
+  const int simd_width = 8;
+  __m256 arr_r = _mm256_loadu_ps(arr);
+  __m256 weight_r = _mm256_loadu_ps(weight);
+  arr_r = _mm256_mul_ps(arr_r, weight_r);
+  __m256 max_r = arr_r;
+  __m256 min_r = arr_r;
+
+  __m256i idx_r = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+  __m256i min_pos_r = idx_r;
+  __m256i max_pos_r = idx_r;
+
+  __m256i inc = _mm256_set1_epi32(simd_width);
+
+  size_t quot = N / simd_width;
+  size_t limit = quot * simd_width;
+
+  for (size_t i = simd_width; i < limit; i += simd_width) {
+    idx_r = _mm256_add_epi32(idx_r, inc);
+    arr_r = _mm256_loadu_ps(arr + i);
+    weight_r = _mm256_loadu_ps(weight + i);
+    arr_r = _mm256_mul_ps(arr_r, weight_r);
+
+    __m256i min_mask =
+        _mm256_castps_si256(_mm256_cmp_ps(arr_r, min_r, _CMP_LT_OQ));
+    __m256i max_mask =
+        _mm256_castps_si256(_mm256_cmp_ps(arr_r, max_r, _CMP_GT_OQ));
+
+    min_r = _mm256_min_ps(min_r, arr_r);
+    min_pos_r = _mm256_blendv_epi8(min_pos_r, idx_r, min_mask);
+
+    max_r = _mm256_max_ps(max_r, arr_r);
+    max_pos_r = _mm256_blendv_epi8(max_pos_r, idx_r, max_mask);
+  }
+
+  // Unload from vector register and reduce
+  float max_tmp[simd_width];
+  float min_tmp[simd_width];
+
+  uint32_t max_pos_temp[simd_width];
+  uint32_t min_pos_temp[simd_width];
+
+  _mm256_storeu_ps(min_tmp, min_r);
+  _mm256_storeu_si256((__m256i_u *)min_pos_temp, min_pos_r);
+
+  _mm256_storeu_ps(max_tmp, max_r);
+  _mm256_storeu_si256((__m256i_u *)max_pos_temp, max_pos_r);
+
+  max = max_tmp[0];
+  maxPos = max_pos_temp[0];
+  min = min_tmp[0];
+  minPos = min_pos_temp[0];
+
+  for (int i = 1; i < simd_width; i++) {
+    if (max_tmp[i] > max) {
+      max = max_tmp[i];
+      maxPos = max_pos_temp[i];
+    } else if (max_tmp[i] == max) {
+      maxPos = std::min(maxPos, size_t(max_pos_temp[i]));
+    }
+    if (min_tmp[i] < min) {
+      min = min_tmp[i];
+      minPos = min_pos_temp[i];
+    } else if (min_tmp[i] == min) {
+      minPos = std::min(minPos, size_t(min_pos_temp[i]));
+    }
+  }
+
+  // Min max for reminder
+  for (size_t i = limit; i < N; i++) {
+    float val = arr[i] * weight[i];
+    if (max < val) {
+      max = val;
+      maxPos = i;
+    }
+    if (min > val) {
+      min = val;
+      minPos = i;
+    }
+  }
+  return true;
+}
+#endif
 
 
 
@@ -218,16 +425,28 @@ void minMaxMasked(T &minVal, T &maxVal,
   T minv = array.data()[0] * weight.data()[0];
   T maxv = minv;
   if (array.contiguousStorage()  &&  weight.contiguousStorage()) {
-    typename Array<T, Alloc>::const_contiter iter = array.cbegin();
-    typename Array<T, Alloc>::const_contiter witer = weight.cbegin();
-    for (size_t i=0; i<n; ++i, ++iter, ++witer) {
-      T tmp = *iter * *witer;
-      if (tmp < minv) {
-        minv = tmp;
-        minp = i;
-      } else if (tmp > maxv) {
-        maxv = tmp;
-        maxp = i;
+    bool vectorized = false;
+
+    #ifdef __AVX__
+      if (n < INT_MAX) {
+        const T *arrRaw = array.data();
+        const T *weightRaw = weight.data();
+        vectorized = min_max_avx(arrRaw, weightRaw, n, minv, minp, maxv, maxp);
+      }
+    #endif
+
+    if (!vectorized) {
+      typename Array<T, Alloc>::const_contiter iter = array.cbegin();
+      typename Array<T, Alloc>::const_contiter witer = weight.cbegin();
+      for (size_t i=0; i<n; ++i, ++iter, ++witer) {
+        T tmp = *iter * *witer;
+        if (tmp < minv) {
+          minv = tmp;
+          minp = i;
+        } else if (tmp > maxv) {
+          maxv = tmp;
+          maxp = i;
+        }
       }
     }
   } else {
@@ -251,6 +470,7 @@ void minMaxMasked(T &minVal, T &maxVal,
   minVal = minv;
   maxVal = maxv;
 }
+
 
 
 // <thrown>
@@ -590,12 +810,81 @@ Array<T, Alloc> operator^ (const T &left, const Array<T, Alloc> &right)
     return arrayTransformResult (left, right, [](T a, T b){ return a^b; });
 }
 
+
+
+#ifdef __AVX__
+template<typename T>
+bool inline min_max_avx(const T *arr, size_t N, T &min, T &max) {
+  return false;
+}
+template<>
+bool inline min_max_avx(const float *arr, size_t N, float &min, float &max)
+{
+  const int simd_width = 8;
+  __m256 arr_r = _mm256_loadu_ps(arr);
+  __m256 max_r = arr_r;
+  __m256 min_r = arr_r;
+
+  size_t quot = N / simd_width;
+  size_t limit = quot * simd_width;
+
+  for (size_t i = simd_width; i < limit; i += simd_width)
+  {
+    arr_r = _mm256_loadu_ps(arr + i);
+
+    min_r = _mm256_min_ps(min_r, arr_r);
+
+    max_r = _mm256_max_ps(max_r, arr_r);
+  }
+
+  // Unload from vector register and reduce
+  float max_tmp[simd_width];
+  float min_tmp[simd_width];
+
+  _mm256_storeu_ps(min_tmp, min_r);
+
+  _mm256_storeu_ps(max_tmp, max_r);
+
+  max = max_tmp[0];
+  min = min_tmp[0];
+
+  for (int i = 1; i < simd_width; i++)
+  {
+    if (max_tmp[i] > max)
+    {
+      max = max_tmp[i];
+    }
+    if (min_tmp[i] < min)
+    {
+      min = min_tmp[i];
+    }
+  }
+
+  // Min max for reminder
+  for (size_t i = limit; i < N; i++)
+  {
+    if (max < arr[i])
+    {
+      max = arr[i];
+    }
+    if (min > arr[i])
+    {
+      min = arr[i];
+    }
+  }
+  return true;
+}
+#endif
+
+
+
 // <thrown>
 //   </item> ArrayError
 // </thrown>
 template<typename T, typename Alloc> void minMax(T &minVal, T &maxVal, const Array<T, Alloc> &array)
 {
-  if (array.nelements() == 0) {
+  size_t n = array.nelements();
+  if (n == 0) {
     throw(ArrayError("void minMax(T &min, T &max, const Array<T, Alloc> &array) - "
                      "Array has no elements"));	
   }
@@ -603,17 +892,29 @@ template<typename T, typename Alloc> void minMax(T &minVal, T &maxVal, const Arr
     // minimal scope as some compilers may spill onto stack otherwise
     T minv = array.data()[0];
     T maxv = minv;
-    typename Array<T, Alloc>::const_contiter iterEnd = array.cend();
-    for (typename Array<T, Alloc>::const_contiter iter = array.cbegin();
-         iter!=iterEnd; ++iter) {
-      if (*iter < minv) {
-        minv = *iter;
+    bool vectorized = false;
+
+    #ifdef __AVX__
+      if (n < INT_MAX) {
+        const T *arrRaw = array.data();
+        vectorized = min_max_avx(arrRaw, n, minv, maxv);
       }
-      // no else allows compiler to use branchless instructions
-      if (*iter > maxv) {
-        maxv = *iter;
+    #endif
+
+    if (!vectorized) {
+      typename Array<T, Alloc>::const_contiter iterEnd = array.cend();
+      for (typename Array<T, Alloc>::const_contiter iter = array.cbegin();
+          iter!=iterEnd; ++iter) {
+        if (*iter < minv) {
+          minv = *iter;
+        }
+        // no else allows compiler to use branchless instructions
+        if (*iter > maxv) {
+          maxv = *iter;
+        }
       }
     }
+
     maxVal = maxv;
     minVal = minv;
   } else {
@@ -633,6 +934,8 @@ template<typename T, typename Alloc> void minMax(T &minVal, T &maxVal, const Arr
     minVal = minv;
   }
 }
+
+
 
 // <thrown>
 //   </item> ArrayConformanceError
